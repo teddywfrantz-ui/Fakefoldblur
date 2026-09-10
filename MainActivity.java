@@ -1,131 +1,190 @@
 package com.example.foldblur;
 
-import android.Manifest;
 import android.app.Activity;
+import android.app.Presentation;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.ColorDrawable;
 import android.graphics.ImageDecoder;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.hardware.display.DisplayManager;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-public class MainActivity extends Activity {
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Full-screen proof-of-concept modeled after the Reddit developer's stated architecture:
+ * a foreground app owns the visible pixels, an AGSL shader is driven directly by
+ * TYPE_HINGE_ANGLE, and Presentation renders the same hinge state on any second internal
+ * display Android exposes as presentation-capable.
+ *
+ * This deliberately does NOT use SYSTEM_ALERT_WINDOW and does NOT render on top of One UI.
+ * The previous overlay architecture caused ghosting, duplicate screenshots, display-role
+ * mistakes and Presentation eligibility problems because our app was not the top visible task.
+ */
+public class MainActivity extends Activity implements
+        SensorEventListener,
+        DisplayManager.DisplayListener {
 
     private static final int REQ_OUTER = 101;
     private static final int REQ_INNER = 102;
+    private static final String PREFS = VisualConfig.PREFS;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener =
-            (prefs, key) -> {
-                if ("diagnostics".equals(key) || "service_running".equals(key) || "hinge_angle".equals(key)) {
-                    refreshStatus();
-                }
-            };
+    private final Map<Integer, DemoPresentation> presentations = new HashMap<>();
 
-    private TextView status;
-    private TextView previewAngle;
-    private FrameLayout previewFrame;
-    private FoldShaderView previewView;
-    private SeekBar previewSeek;
-    private Button previewRoleButton;
-
-    private SeekBar blurSeek;
-    private SeekBar featherSeek;
-    private SeekBar refractionSeek;
-    private SeekBar glassSeek;
-    private SeekBar smoothingSeek;
-    private SeekBar innerWidthSeek;
-    private CheckBox scrubBarsCheck;
+    private SensorManager sensorManager;
+    private Sensor hingeSensor;
+    private DisplayManager displayManager;
+    private PowerManager.WakeLock wakeLock;
 
     private Bitmap outerBitmap;
     private Bitmap innerBitmap;
-    private VisualConfig config;
-    private int previewRole = FoldShaderView.ROLE_INNER;
-    private float previewProgress = 0.30f;
+    private FoldShaderView mainShader;
+    private TextView statusView;
+
+    private boolean demoMode;
+    private float lastAngle = 180f;
+    private float direction = 1f;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        config = VisualConfig.load(this);
-        buildUi();
-        loadPreviewBitmaps();
-        applyConfigToControls();
-        refreshStatus();
 
-        getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE)
-                .registerOnSharedPreferenceChangeListener(prefListener);
+        sensorManager = getSystemService(SensorManager.class);
+        displayManager = getSystemService(DisplayManager.class);
+        hingeSensor = sensorManager == null ? null : sensorManager.getDefaultSensor(Sensor.TYPE_HINGE_ANGLE);
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 200);
+        if (displayManager != null) {
+            displayManager.registerDisplayListener(this, null);
+        }
+        if (sensorManager != null && hingeSensor != null) {
+            // Register once for the lifetime of the Activity. We do not tear this down during
+            // cover/main display handoff, which avoids the "starts then freezes" failure.
+            sensorManager.registerListener(this, hingeSensor, SensorManager.SENSOR_DELAY_FASTEST);
+        }
+
+        loadBitmaps();
+        demoMode = savedInstanceState != null && savedInstanceState.getBoolean("demo_mode", false);
+
+        configureWindowForWake();
+
+        if (demoMode && outerBitmap != null && innerBitmap != null) {
+            enterDemo(false);
+        } else {
+            showSetup();
         }
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        refreshStatus();
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean("demo_mode", demoMode);
+        super.onSaveInstanceState(outState);
     }
 
     @Override
     protected void onDestroy() {
-        getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE)
-                .unregisterOnSharedPreferenceChangeListener(prefListener);
+        if (sensorManager != null) sensorManager.unregisterListener(this);
+        if (displayManager != null) {
+            try { displayManager.unregisterDisplayListener(this); } catch (Throwable ignored) {}
+        }
+        dismissAllPresentations();
+        releaseWakeLock();
         super.onDestroy();
     }
 
-    private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (demoMode) {
+            configureWindowForWake();
+            getWindow().getDecorView().post(() -> {
+                forceMainRoleFromCurrentGeometry();
+                syncPresentations();
+                applyAngle(lastAngle);
+            });
+        }
+    }
 
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && demoMode) {
+            applyImmersive();
+            getWindow().getDecorView().post(() -> {
+                forceMainRoleFromCurrentGeometry();
+                syncPresentations();
+            });
+        }
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (demoMode) {
+            exitDemo();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    private void showSetup() {
+        demoMode = false;
+        dismissAllPresentations();
+        releaseWakeLock();
+        showSystemBars();
+
+        ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(20), dp(36), dp(20), dp(42));
+        root.setPadding(dp(20), dp(42), dp(20), dp(42));
         root.setBackgroundColor(Color.rgb(247, 247, 249));
         scroll.addView(root, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Fold Blur — Final Test", 29f, Color.BLACK);
+        TextView title = text("Fold Blur POC", 30f, Color.BLACK);
         root.addView(title, mw());
 
         TextView body = text(
-                "This build keeps One UI Home. It pre-arms Presentation windows on secondary displays, drives the same AGSL renderer from the live hinge angle, and keeps the inner optical effect on the LEFT half only. The right half of the inner screenshot stays crisp.",
+                "This test is a full-screen fake home-screen demo, not an overlay. That is intentional: the app itself must be the top visible task so Android can allow Presentation on another internal display. The screenshots are the screens; the hinge sensor drives the AGSL effect directly.",
                 15.5f,
                 Color.DKGRAY);
         LinearLayout.LayoutParams bodyLp = mw();
         bodyLp.topMargin = dp(10);
         root.addView(body, bodyLp);
 
-        TextView warning = text(
-                "For this test, the service aggressively keeps display render targets ready while it is running. Stop the service when you are finished testing.",
-                13.5f,
-                Color.rgb(95, 65, 0));
-        LinearLayout.LayoutParams warningLp = mw();
-        warningLp.topMargin = dp(10);
-        root.addView(warning, warningLp);
-
-        status = text("", 13.5f, Color.rgb(55, 55, 60));
-        status.setBackgroundColor(Color.WHITE);
-        status.setPadding(dp(12), dp(12), dp(12), dp(12));
+        statusView = text("", 13.5f, Color.rgb(55, 55, 60));
+        statusView.setBackgroundColor(Color.WHITE);
+        statusView.setPadding(dp(12), dp(12), dp(12), dp(12));
         LinearLayout.LayoutParams statusLp = mw();
         statusLp.topMargin = dp(16);
-        root.addView(status, statusLp);
+        root.addView(statusView, statusLp);
 
         Button outer = button("SELECT OUTER SCREENSHOT");
         outer.setOnClickListener(v -> pickImage(REQ_OUTER));
@@ -137,177 +196,321 @@ public class MainActivity extends Activity {
         inner.setOnClickListener(v -> pickImage(REQ_INNER));
         root.addView(inner, mw());
 
-        Button overlay = button("ALLOW DRAW OVER OTHER APPS");
-        overlay.setOnClickListener(v -> {
-            Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName()));
-            startActivity(i);
+        Button start = button("START FULL-SCREEN HINGE DEMO");
+        start.setOnClickListener(v -> {
+            loadBitmaps();
+            if (outerBitmap == null || innerBitmap == null) {
+                Toast.makeText(this, "Select both screenshots first.", Toast.LENGTH_LONG).show();
+                return;
+            }
+            enterDemo(true);
         });
-        root.addView(overlay, mw());
+        LinearLayout.LayoutParams startLp = mw();
+        startLp.topMargin = dp(12);
+        root.addView(start, startLp);
 
-        Button start = button("START + ARM BOTH DISPLAYS");
-        start.setOnClickListener(v -> startTransitionService());
-        root.addView(start, mw());
-
-        Button stop = button("STOP SERVICE");
-        stop.setOnClickListener(v -> {
-            stopService(new Intent(this, HingeOverlayService.class));
-            Toast.makeText(this, "Fold Blur service stopped.", Toast.LENGTH_SHORT).show();
-            handler.postDelayed(this::refreshStatus, 250L);
-        });
-        root.addView(stop, mw());
-
-        addSectionHeader(root, "ON-DEVICE PREVIEW");
-
-        TextView previewHelp = text(
-                "Use this before folding. It is the exact same shader used by the overlay and Presentation windows, so visual tuning no longer requires another GitHub build.",
+        TextView exitHint = text(
+                "While the demo is running, use Back to return here. For closing tests, also enable this app under Samsung Settings > Display > Continue apps on cover screen.",
                 13.5f,
                 Color.DKGRAY);
-        root.addView(previewHelp, mw());
-
-        previewRoleButton = button("PREVIEW: INNER / LEFT-HALF EFFECT");
-        previewRoleButton.setOnClickListener(v -> {
-            previewRole = previewRole == FoldShaderView.ROLE_INNER
-                    ? FoldShaderView.ROLE_OUTER
-                    : FoldShaderView.ROLE_INNER;
-            updatePreviewRoleLabel();
-            if (previewView != null) previewView.setRoleOverride(previewRole);
-        });
-        LinearLayout.LayoutParams roleLp = mw();
-        roleLp.topMargin = dp(8);
-        root.addView(previewRoleButton, roleLp);
-
-        previewFrame = new FrameLayout(this);
-        previewFrame.setBackgroundColor(Color.BLACK);
-        LinearLayout.LayoutParams frameLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(330));
-        frameLp.topMargin = dp(8);
-        root.addView(previewFrame, frameLp);
-
-        previewAngle = text("Preview hinge: 54°", 13.5f, Color.DKGRAY);
-        LinearLayout.LayoutParams angleLp = mw();
-        angleLp.topMargin = dp(8);
-        root.addView(previewAngle, angleLp);
-
-        previewSeek = new SeekBar(this);
-        previewSeek.setMax(1800);
-        previewSeek.setProgress(540);
-        previewSeek.setOnSeekBarChangeListener(new SimpleSeekListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                previewProgress = progress / 1800f;
-                previewAngle.setText("Preview hinge: " + Math.round(previewProgress * 180f) + "°");
-                if (previewView != null) previewView.setState(previewProgress, 1f);
-            }
-        });
-        root.addView(previewSeek, mw());
-
-        addSectionHeader(root, "VISUAL TUNING — LIVE, NO REBUILD");
-
-        blurSeek = addTuningSlider(root, "Blur strength", 60, 150, percent(config.blurStrength));
-        featherSeek = addTuningSlider(root, "Edge softness / feather", 65, 150, percent(config.feather));
-        refractionSeek = addTuningSlider(root, "Glass refraction", 0, 160, percent(config.refraction));
-        glassSeek = addTuningSlider(root, "Other-screen glass reflection", 0, 12, Math.round(config.glassMix * 100f));
-        smoothingSeek = addTuningSlider(root, "Motion smoothing (ms)", 0, 50, Math.round(config.smoothingMs));
-        innerWidthSeek = addTuningSlider(root, "Inner LEFT-side affected width", 45, 60, Math.round(config.innerWidth * 100f));
-
-        SeekBar.OnSeekBarChangeListener tuningListener = new SimpleSeekListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) readControlsAndApply();
-            }
-        };
-        blurSeek.setOnSeekBarChangeListener(tuningListener);
-        featherSeek.setOnSeekBarChangeListener(tuningListener);
-        refractionSeek.setOnSeekBarChangeListener(tuningListener);
-        glassSeek.setOnSeekBarChangeListener(tuningListener);
-        smoothingSeek.setOnSeekBarChangeListener(tuningListener);
-        innerWidthSeek.setOnSeekBarChangeListener(tuningListener);
-
-        scrubBarsCheck = new CheckBox(this);
-        scrubBarsCheck.setText("Suppress duplicate status/navigation bars from screenshots");
-        scrubBarsCheck.setTextSize(13.5f);
-        scrubBarsCheck.setChecked(config.scrubBars);
-        scrubBarsCheck.setOnCheckedChangeListener((buttonView, isChecked) -> readControlsAndApply());
-        root.addView(scrubBarsCheck, mw());
-
-        Button reset = button("RESET APPLE-LIKE DEFAULTS");
-        reset.setOnClickListener(v -> {
-            config = VisualConfig.defaults();
-            config.save(this);
-            applyConfigToControls();
-            applyConfigEverywhere();
-        });
-        root.addView(reset, mw());
+        LinearLayout.LayoutParams hintLp = mw();
+        hintLp.topMargin = dp(12);
+        root.addView(exitHint, hintLp);
 
         setContentView(scroll);
-        updatePreviewRoleLabel();
+        refreshStatus();
     }
 
-    private void addSectionHeader(LinearLayout root, String label) {
-        TextView h = text(label, 15f, Color.BLACK);
-        h.setAllCaps(false);
-        h.setPadding(0, dp(18), 0, dp(7));
-        root.addView(h, mw());
+    private void enterDemo(boolean announce) {
+        demoMode = true;
+        acquireWakeLock();
+        configureWindowForWake();
+        applyImmersive();
+
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
+        root.setKeepScreenOn(true);
+
+        mainShader = new FoldShaderView(this, outerBitmap, innerBitmap);
+        root.addView(mainShader, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // Invisible touch target in the upper-left. Long-press is an emergency exit if the
+        // system Back gesture becomes awkward while the Fold is partly open.
+        View exitTarget = new View(this);
+        exitTarget.setBackgroundColor(Color.TRANSPARENT);
+        exitTarget.setOnLongClickListener(v -> {
+            exitDemo();
+            return true;
+        });
+        FrameLayout.LayoutParams exitLp = new FrameLayout.LayoutParams(dp(72), dp(72), Gravity.TOP | Gravity.START);
+        root.addView(exitTarget, exitLp);
+
+        setContentView(root);
+
+        root.post(() -> {
+            forceMainRoleFromCurrentGeometry();
+            applyAngle(lastAngle);
+            syncPresentations();
+        });
+
+        if (announce) {
+            Toast.makeText(this, "Demo running. Fold/unfold now. Back exits.", Toast.LENGTH_LONG).show();
+        }
     }
 
-    private SeekBar addTuningSlider(LinearLayout root, String label, int min, int max, int value) {
-        TextView l = text(label, 13.5f, Color.DKGRAY);
-        root.addView(l, mw());
-        SeekBar s = new SeekBar(this);
-        s.setMin(min);
-        s.setMax(max);
-        s.setProgress(Math.max(min, Math.min(max, value)));
-        root.addView(s, mw());
-        return s;
+    private void exitDemo() {
+        demoMode = false;
+        dismissAllPresentations();
+        mainShader = null;
+        releaseWakeLock();
+        showSetup();
     }
 
-    private void applyConfigToControls() {
-        if (blurSeek == null) return;
-        blurSeek.setProgress(percent(config.blurStrength));
-        featherSeek.setProgress(percent(config.feather));
-        refractionSeek.setProgress(percent(config.refraction));
-        glassSeek.setProgress(Math.round(config.glassMix * 100f));
-        smoothingSeek.setProgress(Math.round(config.smoothingMs));
-        innerWidthSeek.setProgress(Math.round(config.innerWidth * 100f));
-        scrubBarsCheck.setChecked(config.scrubBars);
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        if (event.sensor.getType() != Sensor.TYPE_HINGE_ANGLE || event.values.length == 0) return;
+        float angle = clamp(event.values[0], 0f, 180f);
+        float delta = angle - lastAngle;
+        if (Math.abs(delta) > 0.03f) direction = delta >= 0f ? 1f : -1f;
+        lastAngle = angle;
+
+        if (demoMode) {
+            // Direct sensor -> shader update. Android coalesces invalidates to display vsync,
+            // so there is no independent animation loop to stall during the display handoff.
+            applyAngle(angle);
+            syncPresentations();
+        } else {
+            refreshStatus();
+        }
     }
 
-    private int percent(float value) {
-        return Math.round(value * 100f);
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
     }
 
-    private void readControlsAndApply() {
-        config.blurStrength = blurSeek.getProgress() / 100f;
-        config.feather = featherSeek.getProgress() / 100f;
-        config.refraction = refractionSeek.getProgress() / 100f;
-        config.glassMix = glassSeek.getProgress() / 100f;
-        config.smoothingMs = smoothingSeek.getProgress();
-        config.innerWidth = innerWidthSeek.getProgress() / 100f;
-        config.scrubBars = scrubBarsCheck.isChecked();
-        config.save(this);
-        applyConfigEverywhere();
+    private void applyAngle(float angle) {
+        float p = angle / 180f;
+        if (mainShader != null) mainShader.setState(p, direction);
+        for (DemoPresentation presentation : new ArrayList<>(presentations.values())) {
+            presentation.setState(p, direction);
+        }
     }
 
-    private void applyConfigEverywhere() {
-        if (previewView != null) previewView.setConfig(config);
-        if (getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE)
-                .getBoolean("service_running", false)) {
-            Intent update = new Intent(this, HingeOverlayService.class);
-            update.setAction(HingeOverlayService.ACTION_UPDATE_CONFIG);
+    private void forceMainRoleFromCurrentGeometry() {
+        if (mainShader == null) return;
+        View decor = getWindow().getDecorView();
+        int w = decor.getWidth();
+        int h = decor.getHeight();
+        if (w <= 0 || h <= 0) return;
+        mainShader.setRoleOverride(isInnerGeometry(w, h) ? FoldShaderView.ROLE_INNER : FoldShaderView.ROLE_OUTER);
+    }
+
+    private void syncPresentations() {
+        if (!demoMode || displayManager == null || outerBitmap == null || innerBitmap == null) return;
+
+        int currentId = -1;
+        Display current = getDisplay();
+        if (current != null) currentId = current.getDisplayId();
+
+        Map<Integer, Display> candidates = new LinkedHashMap<>();
+
+        // This is the important path on modern Android: only ask for displays the framework
+        // explicitly marks as presentation-capable. Android 16 can expose built-in internal
+        // displays here, provided the app itself is the top visible task on a different display.
+        try {
+            for (Display d : displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)) {
+                if (d != null) candidates.put(d.getDisplayId(), d);
+            }
+        } catch (Throwable ignored) {
+        }
+
+        // Runtime fallback: some OEM builds expose the same capability flag through getDisplays().
+        try {
+            for (Display d : displayManager.getDisplays()) {
+                if (d != null && (d.getFlags() & Display.FLAG_PRESENTATION) != 0) {
+                    candidates.put(d.getDisplayId(), d);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        // Never keep a Presentation on the display that now owns the Activity. That exact mistake
+        // produced stacked copies / ghosting in the previous build after the fold handoff.
+        for (Map.Entry<Integer, DemoPresentation> e : new ArrayList<>(presentations.entrySet())) {
+            DemoPresentation p = e.getValue();
+            Display d = p == null ? null : p.getDisplay();
+            if (d == null || !d.isValid() || e.getKey() == currentId) {
+                presentations.remove(e.getKey());
+                safeDismiss(p);
+            }
+        }
+
+        for (Display display : candidates.values()) {
+            if (display == null || !display.isValid()) continue;
+            int id = display.getDisplayId();
+            if (id == currentId || presentations.containsKey(id)) continue;
+            if (!looksLikePhonePanel(display)) continue;
+
             try {
-                startService(update);
+                int role = roleForDisplay(display);
+                DemoPresentation p = new DemoPresentation(this, display, outerBitmap, innerBitmap, role);
+                p.setOnDismissListener(dialog -> {
+                    presentations.remove(id);
+                    if (demoMode) getWindow().getDecorView().postDelayed(this::syncPresentations, 30L);
+                });
+                p.show();
+                presentations.put(id, p);
+                p.setState(lastAngle / 180f, direction);
             } catch (Throwable ignored) {
+                // Android may temporarily reject a built-in target during a device-state change.
+                // Display callbacks and the next sensor sample will retry immediately.
             }
         }
     }
 
-    private void updatePreviewRoleLabel() {
-        if (previewRoleButton == null) return;
-        previewRoleButton.setText(previewRole == FoldShaderView.ROLE_INNER
-                ? "PREVIEW: INNER / LEFT-HALF EFFECT"
-                : "PREVIEW: OUTER / FULL-PANEL EFFECT");
+    private int roleForDisplay(Display display) {
+        try {
+            Display.Mode mode = display.getMode();
+            if (mode != null) {
+                return isInnerGeometry(mode.getPhysicalWidth(), mode.getPhysicalHeight())
+                        ? FoldShaderView.ROLE_INNER
+                        : FoldShaderView.ROLE_OUTER;
+            }
+        } catch (Throwable ignored) {
+        }
+        return FoldShaderView.ROLE_OUTER;
+    }
+
+    private boolean looksLikePhonePanel(Display d) {
+        try {
+            Display.Mode m = d.getMode();
+            if (m == null) return true;
+            int min = Math.min(m.getPhysicalWidth(), m.getPhysicalHeight());
+            int max = Math.max(m.getPhysicalWidth(), m.getPhysicalHeight());
+            float ratio = max == 0 ? 0f : (float) min / (float) max;
+            return min >= 600 && max >= 900 && ratio >= 0.36f && ratio <= 0.95f;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private boolean isInnerGeometry(int w, int h) {
+        int min = Math.min(w, h);
+        int max = Math.max(w, h);
+        return max > 0 && ((float) min / (float) max) >= 0.62f;
+    }
+
+    @Override
+    public void onDisplayAdded(int displayId) {
+        if (demoMode) getWindow().getDecorView().post(this::syncPresentations);
+        else refreshStatus();
+    }
+
+    @Override
+    public void onDisplayRemoved(int displayId) {
+        DemoPresentation p = presentations.remove(displayId);
+        safeDismiss(p);
+        if (demoMode) getWindow().getDecorView().post(this::syncPresentations);
+        else refreshStatus();
+    }
+
+    @Override
+    public void onDisplayChanged(int displayId) {
+        if (demoMode) {
+            getWindow().getDecorView().post(() -> {
+                forceMainRoleFromCurrentGeometry();
+                syncPresentations();
+                applyAngle(lastAngle);
+            });
+        } else {
+            refreshStatus();
+        }
+    }
+
+    private void configureWindowForWake() {
+        Window w = getWindow();
+        if (w == null) return;
+        w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+        w.setStatusBarColor(Color.TRANSPARENT);
+        w.setNavigationBarColor(Color.TRANSPARENT);
+        try {
+            setTurnScreenOn(true);
+            setShowWhenLocked(true);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void acquireWakeLock() {
+        if (wakeLock != null && wakeLock.isHeld()) return;
+        try {
+            PowerManager pm = getSystemService(PowerManager.class);
+            if (pm == null) return;
+            wakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                            | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                            | PowerManager.ON_AFTER_RELEASE,
+                    "FoldBlur::DemoScreens");
+            wakeLock.setReferenceCounted(false);
+            wakeLock.acquire(10 * 60 * 1000L);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        } catch (Throwable ignored) {
+        }
+        wakeLock = null;
+    }
+
+    private void applyImmersive() {
+        Window window = getWindow();
+        if (window == null) return;
+        View decor = window.getDecorView();
+        decor.setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        try {
+            WindowInsetsController c = decor.getWindowInsetsController();
+            if (c != null) {
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void showSystemBars() {
+        Window window = getWindow();
+        if (window == null) return;
+        View decor = window.getDecorView();
+        decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        try {
+            WindowInsetsController c = decor.getWindowInsetsController();
+            if (c != null) c.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void dismissAllPresentations() {
+        for (DemoPresentation p : new ArrayList<>(presentations.values())) safeDismiss(p);
+        presentations.clear();
+    }
+
+    private static void safeDismiss(Presentation p) {
+        if (p == null) return;
+        try { p.dismiss(); } catch (Throwable ignored) {}
     }
 
     private void pickImage(int request) {
@@ -329,26 +532,13 @@ public class MainActivity extends Activity {
         }
 
         String key = requestCode == REQ_OUTER ? "outer_uri" : "inner_uri";
-        getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(key, uri.toString())
-                .apply();
-
-        loadPreviewBitmaps();
-        if (getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE)
-                .getBoolean("service_running", false)) {
-            Intent reload = new Intent(this, HingeOverlayService.class);
-            reload.setAction(HingeOverlayService.ACTION_RELOAD);
-            try {
-                startService(reload);
-            } catch (Throwable ignored) {
-            }
-        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(key, uri.toString()).apply();
+        loadBitmaps();
         refreshStatus();
     }
 
-    private void loadPreviewBitmaps() {
-        SharedPreferences p = getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE);
+    private void loadBitmaps() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
         try {
             String outer = p.getString("outer_uri", null);
             String inner = p.getString("inner_uri", null);
@@ -356,76 +546,53 @@ public class MainActivity extends Activity {
             if (inner != null) innerBitmap = loadBitmap(Uri.parse(inner));
         } catch (Throwable ignored) {
         }
-        rebuildPreview();
     }
 
     private Bitmap loadBitmap(Uri uri) throws Exception {
         ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
-        return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
-            decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
-            decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
-        });
-    }
-
-    private void rebuildPreview() {
-        if (previewFrame == null) return;
-        previewFrame.removeAllViews();
-        previewView = null;
-
-        if (outerBitmap == null || innerBitmap == null) {
-            TextView empty = text("Select both screenshots to preview the shader.", 14f, Color.WHITE);
-            empty.setGravity(Gravity.CENTER);
-            previewFrame.addView(empty, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT));
-            return;
-        }
-
-        previewView = new FoldShaderView(this, outerBitmap, innerBitmap);
-        previewView.setRoleOverride(previewRole);
-        previewView.setConfig(config);
-        previewView.setState(previewProgress, 1f);
-        previewFrame.addView(previewView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-    }
-
-    private void startTransitionService() {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Allow Draw over other apps first.", Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        SharedPreferences p = getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE);
-        if (p.getString("outer_uri", null) == null || p.getString("inner_uri", null) == null) {
-            Toast.makeText(this, "Select both screenshots first.", Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        Intent service = new Intent(this, HingeOverlayService.class);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
-        Toast.makeText(this,
-                "Final test armed. Return to One UI Home, then open/close the Fold slowly.",
-                Toast.LENGTH_LONG).show();
-        handler.postDelayed(this::refreshStatus, 350L);
+        return ImageDecoder.decodeBitmap(source, (decoder, info, src) ->
+                decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE));
     }
 
     private void refreshStatus() {
-        if (status == null) return;
-        SharedPreferences p = getSharedPreferences(VisualConfig.PREFS, MODE_PRIVATE);
-        boolean outerSet = p.getString("outer_uri", null) != null;
-        boolean innerSet = p.getString("inner_uri", null) != null;
-        boolean running = p.getBoolean("service_running", false);
-        boolean hinge = p.getBoolean("hinge_available", false);
-        String diagnostics = p.getString("diagnostics", "No display diagnostics yet.");
+        if (statusView == null) return;
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean outer = p.getString("outer_uri", null) != null;
+        boolean inner = p.getString("inner_uri", null) != null;
 
-        status.setText(
-                "Outer screenshot: " + (outerSet ? "SET" : "NOT SET")
-                        + "\nInner screenshot: " + (innerSet ? "SET" : "NOT SET")
-                        + "\nOverlay permission: " + (Settings.canDrawOverlays(this) ? "ALLOWED" : "NOT ALLOWED")
-                        + "\nService: " + (running ? "RUNNING / ARMED" : "STOPPED")
-                        + "\nHinge sensor: " + (hinge ? "DETECTED" : (running ? "NOT DETECTED" : "checked when service starts"))
-                        + "\n\n" + diagnostics);
+        int all = 0;
+        int presentation = 0;
+        StringBuilder details = new StringBuilder();
+        if (displayManager != null) {
+            try {
+                Display[] allDisplays = displayManager.getDisplays();
+                all = allDisplays.length;
+                for (Display d : allDisplays) {
+                    Display.Mode m = d.getMode();
+                    details.append("\n#").append(d.getDisplayId())
+                            .append(" ").append(d.getName())
+                            .append(" state=").append(d.getState());
+                    if (m != null) {
+                        details.append(" ").append(m.getPhysicalWidth()).append("x").append(m.getPhysicalHeight());
+                    }
+                    if ((d.getFlags() & Display.FLAG_PRESENTATION) != 0) details.append(" PRESENTATION");
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                presentation = displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).length;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        statusView.setText(
+                "Outer screenshot: " + (outer ? "SET" : "NOT SET")
+                        + "\nInner screenshot: " + (inner ? "SET" : "NOT SET")
+                        + "\nContinuous hinge sensor: " + (hingeSensor != null ? "DETECTED" : "NOT DETECTED")
+                        + "\nHinge angle: " + Math.round(lastAngle * 10f) / 10f + "°"
+                        + "\nDisplays visible to app: " + all
+                        + "\nPresentation-capable displays: " + presentation
+                        + details);
     }
 
     private Button button(String label) {
@@ -453,13 +620,61 @@ public class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private abstract static class SimpleSeekListener implements SeekBar.OnSeekBarChangeListener {
-        @Override
-        public void onStartTrackingTouch(SeekBar seekBar) {
+    private static float clamp(float v, float min, float max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    private static final class DemoPresentation extends Presentation {
+        private final Bitmap outer;
+        private final Bitmap inner;
+        private final int role;
+        private FoldShaderView shaderView;
+
+        DemoPresentation(Context context, Display display, Bitmap outer, Bitmap inner, int role) {
+            super(context, display);
+            this.outer = outer;
+            this.inner = inner;
+            this.role = role;
+            setCancelable(false);
         }
 
         @Override
-        public void onStopTrackingTouch(SeekBar seekBar) {
+        protected void onCreate(Bundle savedInstanceState) {
+            super.onCreate(savedInstanceState);
+
+            Window w = getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+                w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                w.setStatusBarColor(Color.TRANSPARENT);
+                w.setNavigationBarColor(Color.TRANSPARENT);
+                View decor = w.getDecorView();
+                decor.setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            }
+
+            FrameLayout root = new FrameLayout(getContext());
+            root.setBackgroundColor(Color.BLACK);
+            root.setKeepScreenOn(true);
+
+            shaderView = new FoldShaderView(getContext(), outer, inner);
+            shaderView.setRoleOverride(role);
+            root.addView(shaderView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+            setContentView(root);
+        }
+
+        void setState(float progress, float direction) {
+            if (shaderView != null) shaderView.setState(progress, direction);
         }
     }
 }
